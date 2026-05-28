@@ -6,11 +6,10 @@ import time
 mp_hands = mp.solutions.hands
 mp_draw  = mp.solutions.drawing_utils
 
-SWIPE_THRESHOLD      = 0.12
-SWIPE_WINDOW         = 0.5
-PINCH_THRESHOLD      = 0.07
 GESTURE_COOLDOWN     = 1.0
-HOLD_FRAMES_REQUIRED = 10
+HOLD_FRAMES_REQUIRED = 6.0
+SWIPE_MIN_DIST       = 0.15
+SWIPE_MAX_TIME       = 0.6
 
 
 class GestureDetector:
@@ -21,33 +20,34 @@ class GestureDetector:
             min_detection_confidence=0.7,
             min_tracking_confidence=0.6,
         )
-        self.position_history     = []
         self.last_gesture_time    = {}
         self.gesture_hold_counter = 0
         self.last_seen_gesture    = "none"
+        self.swipe_start_x        = None
+        self.swipe_start_time     = None
 
     def process_frame(self, frame):
-        h, w   = frame.shape[:2]
-        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w    = frame.shape[:2]
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb)
 
         gesture   = "none"
         laser_pos = None
 
         if results.multi_hand_landmarks:
-            lm       = results.multi_hand_landmarks[0]
+            lm      = results.multi_hand_landmarks[0]
             mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
 
-            pts_norm = [(p.x, p.y) for p in lm.landmark]
-            fingers  = self._fingers_up(pts_norm)
-            self._update_history(pts_norm[0][0])   # track wrist X
+            pts     = [(p.x, p.y) for p in lm.landmark]
+            fingers = self._fingers_up(pts)
+            wx      = pts[0][0]
+            swipe   = self._check_swipe(wx)
 
-            raw = self._classify(fingers, pts_norm)
+            raw = self._classify(fingers, pts, swipe)
 
-            # Laser and swipes are instant — no hold filter, no cooldown
             if raw == "laser":
                 gesture   = "laser"
-                laser_pos = pts_norm[8]             # index fingertip
+                laser_pos = pts[8]
 
             elif raw in ("next", "prev"):
                 now  = time.time()
@@ -57,20 +57,23 @@ class GestureDetector:
                     gesture = raw
                     self.gesture_hold_counter = 0
                     self.last_seen_gesture    = "none"
+                    self.swipe_start_x        = None
+                    self.swipe_start_time     = None
 
             else:
-                # pause / blank / pinch_in — require hold
                 if raw == self.last_seen_gesture:
                     self.gesture_hold_counter += 1
                 else:
                     self.gesture_hold_counter = 1
                     self.last_seen_gesture    = raw
 
-                if self.gesture_hold_counter >= HOLD_FRAMES_REQUIRED:
+                hold_frames = {"pinch_in": 6}
+                cooldowns   = {"pause": 2.0, "blank": 2.0, "pinch_in": 2.5}
+
+                if self.gesture_hold_counter >= hold_frames.get(raw, HOLD_FRAMES_REQUIRED):
+                    cd   = cooldowns.get(raw, GESTURE_COOLDOWN)
                     now  = time.time()
                     last = self.last_gesture_time.get(raw, 0)
-                    cooldowns = {"pause": 2.0, "blank": 2.0, "pinch_in": 2.5}
-                    cd = cooldowns.get(raw, GESTURE_COOLDOWN)
                     if now - last >= cd:
                         self.last_gesture_time[raw] = now
                         gesture = raw
@@ -78,11 +81,36 @@ class GestureDetector:
             self._draw_label(frame, gesture, fingers)
 
         else:
-            self.position_history.clear()
             self.gesture_hold_counter = 0
             self.last_seen_gesture    = "none"
+            self.swipe_start_x        = None
+            self.swipe_start_time     = None
 
         return frame, gesture, laser_pos
+
+    # ── Swipe ────────────────────────────────────────────────────────── #
+
+    def _check_swipe(self, wx):
+        now = time.time()
+        if self.swipe_start_x is None:
+            self.swipe_start_x    = wx
+            self.swipe_start_time = now
+            return None
+        elapsed = now - self.swipe_start_time
+        dist    = wx - self.swipe_start_x
+        if elapsed > SWIPE_MAX_TIME:
+            self.swipe_start_x    = wx
+            self.swipe_start_time = now
+            return None
+        if dist > SWIPE_MIN_DIST:
+            self.swipe_start_x    = wx
+            self.swipe_start_time = now
+            return "next"
+        if dist < -SWIPE_MIN_DIST:
+            self.swipe_start_x    = wx
+            self.swipe_start_time = now
+            return "prev"
+        return None
 
     # ── Finger state ─────────────────────────────────────────────────── #
 
@@ -96,71 +124,51 @@ class GestureDetector:
 
     # ── Classification ───────────────────────────────────────────────── #
 
-    def _classify(self, fingers, pts):
+    def _classify(self, fingers, pts, swipe):
         thumb, index, middle, ring, pinky = fingers
         count = sum(fingers)
 
-        # Swipe — velocity based, highest priority
-        velocity = self._get_velocity()
-        if abs(velocity) > 0.25:
-            swipe = self._detect_swipe()
-            if swipe:
-                return swipe
+        pinch_dist = self._dist(pts[4], pts[8])
 
-        # Fist — before pinch
-        if count == 0:
-            return "blank"
-
-        # Pinch
-        if self._dist(pts[4], pts[8]) < PINCH_THRESHOLD and not middle:
+        # ── Pinch FIRST — before fist, because a pinch curls fingers
+        #    and can look like count==0. Thumb must be somewhat raised
+        #    (not fully tucked) and tip-to-tip distance under threshold.
+        thumb_dist_from_palm = self._dist(pts[4], pts[0])
+        thumb_raised = thumb_dist_from_palm > self._dist(pts[2], pts[0]) * 1.05
+        if pinch_dist < 0.11 and thumb_raised:
             return "pinch_in"
+
+        # Two fingers = swipe gesture
+        is_swipe_shape = index and middle and not ring and not pinky
+        if is_swipe_shape and swipe:
+            return swipe
+
+        # Fist — thumb must also be down to avoid false positives
+        if count == 0 and not thumb_raised:
+            return "blank"
 
         # Open palm
         if count >= 4:
             return "pause"
 
-        # Laser — only index up
+        # Laser
         if index and not middle and not ring and not pinky:
             return "laser"
 
+        if is_swipe_shape:
+            return "none"
+
         return "none"
 
-    # ── Swipe helpers ────────────────────────────────────────────────── #
-
-    def _update_history(self, x):
-        now = time.time()
-        self.position_history.append((x, now))
-        self.position_history = [
-            (px, pt) for px, pt in self.position_history
-            if now - pt < SWIPE_WINDOW
-        ]
-
-    def _get_velocity(self):
-        if len(self.position_history) < 2:
-            return 0
-        dt = self.position_history[-1][1] - self.position_history[0][1]
-        dx = self.position_history[-1][0] - self.position_history[0][0]
-        return 0 if dt < 0.01 else dx / dt
-
-    def _detect_swipe(self):
-        if len(self.position_history) < 4:
-            return None
-        delta = self.position_history[-1][0] - self.position_history[0][0]
-        if delta > SWIPE_THRESHOLD:
-            self.position_history.clear()
-            return "next"
-        if delta < -SWIPE_THRESHOLD:
-            self.position_history.clear()
-            return "prev"
-        return None
-
-    # ── Drawing ──────────────────────────────────────────────────────── #
+    # ── Helpers ──────────────────────────────────────────────────────── #
 
     @staticmethod
     def _dist(a, b):
         return np.hypot(a[0] - b[0], a[1] - b[1])
 
     def _draw_label(self, frame, gesture, fingers):
+        if not gesture:
+            gesture = "none"
         colors = {
             "next":     (0,   255, 100),
             "prev":     (0,   180, 255),
@@ -202,17 +210,14 @@ if __name__ == "__main__":
         frame, gesture, laser = detector.process_frame(frame)
 
         if gesture == "laser" and laser is not None:
-            # Move system cursor — works when this window is NOT focused
             mx = int(laser[0] * sw)
             my = int(laser[1] * sh)
             pyautogui.moveTo(mx, my, duration=0)
-            # Also draw red dot on frame for visual feedback
             fx = int(laser[0] * 640)
             fy = int(laser[1] * 480)
             cv2.circle(frame, (fx, fy), 12, (0, 0, 255), -1)
-
         elif gesture != "none":
-            print(f"  → {gesture}")
+            print(f"  >>> GESTURE: {gesture}")
 
         cv2.imshow("Gesture Detector", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
